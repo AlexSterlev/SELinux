@@ -132,3 +132,134 @@ semodule -i my_nginx_service.pp
   <title>Welcome to CentOS</title>
   <style rel="stylesheet" type="text/css">
   ````
+## Обеспечить работоспособность приложения при включенном selinux.
+С клиента выполним попытку обновления зоны ddns.lab:
+````
+[vagrant@client ~]$ nsupdate -k /etc/named.zonetransfer.key
+> server 192.168.50.10
+> zone ddns.lab
+> update add www.ddns.lab 60 A 192.168.50.15
+> send
+update failed: SERVFAIL
+> quit
+````
+Проверим ошибки в логе SELinux:
+````
+[root@ns01 vagrant]# cat /var/log/audit/audit.log | grep denied
+type=AVC msg=audit(1634209632.336:2469): avc:  denied  { create } for  pid=28895 comm="isc-worker0000" name="named.ddns.lab.view1.jnl" scontext=system_u:system_r:named_t:s0 tcontext=system_u:object_r:etc_t:s0 tclass=file permissive=0
+````
+Посмотрим вывод утилиты sealert:
+````
+found 1 alerts in /var/log/audit/audit.log
+--------------------------------------------------------------------------------
+
+SELinux is preventing /usr/sbin/named from create access on the file named.ddns.lab.view1.jnl.
+
+*****  Plugin catchall_labels (83.8 confidence) suggests   *******************
+
+If you want to allow named to have create access on the named.ddns.lab.view1.jnl file
+Then you need to change the label on named.ddns.lab.view1.jnl
+Do
+# semanage fcontext -a -t FILE_TYPE 'named.ddns.lab.view1.jnl'
+where FILE_TYPE is one of the following: dnssec_trigger_var_run_t, ipa_var_lib_t, krb5_host_rcache_t, krb5_keytab_t, named_cache_t, named_log_t, named_tmp_t, named_var_run_t, named_zone_t.
+Then execute:
+restorecon -v 'named.ddns.lab.view1.jnl'
+
+
+*****  Plugin catchall (17.1 confidence) suggests   **************************
+
+If you believe that named should be allowed create access on the named.ddns.lab.view1.jnl file by default.
+Then you should report this as a bug.
+You can generate a local policy module to allow this access.
+Do
+allow this access for now by executing:
+# ausearch -c 'isc-worker0000' --raw | audit2allow -M my-iscworker0000
+# semodule -i my-iscworker0000.pp
+
+
+Additional Information:
+Source Context                system_u:system_r:named_t:s0
+Target Context                system_u:object_r:etc_t:s0
+Target Objects                named.ddns.lab.view1.jnl [ file ]
+Source                        isc-worker0000
+Source Path                   /usr/sbin/named
+Port                          <Unknown>
+Host                          <Unknown>
+Source RPM Packages           bind-9.11.4-26.P2.el7_9.7.x86_64
+Target RPM Packages
+Policy RPM                    selinux-policy-3.13.1-266.el7.noarch
+Selinux Enabled               True
+Policy Type                   targeted
+Enforcing Mode                Enforcing
+Host Name                     ns01
+Platform                      Linux ns01 3.10.0-1127.el7.x86_64 #1 SMP Tue Mar
+                              31 23:36:51 UTC 2020 x86_64 x86_64
+Alert Count                   1
+First Seen                    2021-10-14 11:07:12 UTC
+Last Seen                     2021-10-14 11:07:12 UTC
+Local ID                      fb5066e9-3676-4d47-be24-50c45783a255
+
+Raw Audit Messages
+type=AVC msg=audit(1634209632.336:2469): avc:  denied  { create } for  pid=28895 comm="isc-worker0000" name="named.ddns.lab.view1.jnl" scontext=system_u:system_r:named_t:s0 tcontext=system_u:object_r:etc_t:s0 tclass=file permissive=0
+
+
+type=SYSCALL msg=audit(1634209632.336:2469): arch=x86_64 syscall=open success=no exit=EACCES a0=7f63394f3050 a1=241 a2=1b6 a3=24 items=0 ppid=1 pid=28895 auid=4294967295 uid=25 gid=25 euid=25 suid=25 fsuid=25 egid=25 sgid=25 fsgid=25 tty=(none) ses=4294967295 comm=isc-worker0000 exe=/usr/sbin/named subj=system_u:system_r:named_t:s0 key=(null)
+
+Hash: isc-worker0000,named_t,etc_t,file,create
+````
+## Следовательно:
+Видим, что SELinux запрещает утилите /usr/sbin/named доступ к созданию файла named.ddns.lab.view1.jnl, а также предлагает два варианта решения проблемы: 1й - с помошью утилиты audit2allow создать ращрешающий модуль; 2й - с помощью утилиты semanage изменить контекст для файла named.ddns.lab.view1.jnl.
+
+Создание модулей утилитой audit2allow не рекомендуется, так как можно предоставить какому-либо приложению слишком широкие полномочия, в которых оно по сути не нуждается, поэтому воспользуемся 2м способом.
+
+Из файла /etc/named.conf узнаем, распололжение файла зоны ddns.lab: /etc/named/dynamic/named.ddns.lab.view1. Смотрим тип файла в его контексте безопасности:
+````
+[root@ns01 ~]# ll -Z /etc/named/dynamic/named.ddns.lab.view1
+-rw-rw----. named named system_u:object_r:etc_t:s0       /etc/named/dynamic/named.ddns.lab.view1
+````
+Видим, что тип - etc_t, а из страницы руководства RedHat следует, что по умолчанию для динамических зон используется директория /var/named/dynamic/, файлы в которой наследуют тип named_cache_t. Изменим тип в контексте для директории /etc/named/dynamic/:
+````
+[root@ns01 ~]# semanage fcontext -a -t named_cache_t '/etc/named/dynamic(/.*)?'
+[root@ns01 ~]# restorecon -R -v /etc/named/dynamic/
+restorecon reset /etc/named/dynamic context unconfined_u:object_r:etc_t:s0->unconfined_u:object_r:named_cache_t:s0
+restorecon reset /etc/named/dynamic/named.ddns.lab context system_u:object_r:etc_t:s0->system_u:object_r:named_cache_t:s0
+restorecon reset /etc/named/dynamic/named.ddns.lab.view1 context system_u:object_r:etc_t:s0->system_u:object_r:named_cache_t:s0
+````
+Повторим попытку изменения зоны ddns.lab:
+````
+[vagrant@client ~]$ nsupdate -k /etc/named.zonetransfer.key
+> server 192.168.50.10
+> zone ddns.lab
+> update add www.ddns.lab. 60 A 192.168.50.15
+> send
+> 
+> quit
+````
+````
+[vagrant@client ~]$ dig www.ddns.lab
+
+; <<>> DiG 9.11.4-P2-RedHat-9.11.4-26.P2.el7_9.7 <<>> www.ddns.lab
+;; global options: +cmd
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 53758
+;; flags: qr aa rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 1, ADDITIONAL: 2
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 4096
+;; QUESTION SECTION:
+;www.ddns.lab.                  IN      A
+
+;; ANSWER SECTION:
+www.ddns.lab.           60      IN      A       192.168.50.15
+
+;; AUTHORITY SECTION:
+ddns.lab.               3600    IN      NS      ns01.dns.lab.
+
+;; ADDITIONAL SECTION:
+ns01.dns.lab.           3600    IN      A       192.168.50.10
+
+;; Query time: 4 msec
+;; SERVER: 192.168.50.10#53(192.168.50.10)
+;; WHEN: Thu Oct 14 11:23:05 UTC 2021
+;; MSG SIZE  rcvd: 96
+````
